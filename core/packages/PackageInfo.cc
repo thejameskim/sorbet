@@ -298,7 +298,8 @@ optional<core::AutocorrectSuggestion> PackageInfo::addImport(const core::GlobalS
         suggestionTitle = fmt::format("Convert existing import to `{}`", importTypeMethod);
     }
 
-    core::AutocorrectSuggestion suggestion(suggestionTitle, edits);
+    core::AutocorrectSuggestion suggestion(suggestionTitle, edits, false /* isDidYouMean */,
+                                           /* shouldSkipWhenAggregated */ true);
     return {suggestion};
 }
 
@@ -344,7 +345,7 @@ optional<core::AutocorrectSuggestion> PackageInfo::addExport(const core::GlobalS
 
     core::AutocorrectSuggestion suggestion(
         fmt::format("Export `{}` in package `{}`", newExportName, mangledName_.owner.show(gs)),
-        {{insertionLoc, fmt::format("\n  {}", exportLine)}});
+        {{insertionLoc, fmt::format("\n  {}", exportLine)}}, false /* isDidYouMean */);
     return {suggestion};
 }
 
@@ -485,7 +486,6 @@ core::packages::ImportType fileToImportType(const core::GlobalState &gs, core::F
 }; // namespace
 
 std::optional<core::AutocorrectSuggestion> PackageInfo::aggregateMissingImports(const core::GlobalState &gs) const {
-    std::vector<core::AutocorrectSuggestion::Edit> allEdits;
     UnorderedMap<core::packages::MangledName, core::packages::ImportType> toImport;
     for (auto &[file, value] : packagesReferencedByFile) {
         for (auto &[packageName, packageReferenceInfo] : value) {
@@ -505,6 +505,8 @@ std::optional<core::AutocorrectSuggestion> PackageInfo::aggregateMissingImports(
             }
         }
     }
+    std::vector<core::AutocorrectSuggestion::Edit> allEdits;
+    // TODO: extract this to a helper
     for (auto &[packageName, importType] : toImport) {
         auto &pkgInfo = gs.packageDB().getPackageInfo(packageName);
         auto autocorrect = this->addImport(gs, pkgInfo, importType);
@@ -518,6 +520,39 @@ std::optional<core::AutocorrectSuggestion> PackageInfo::aggregateMissingImports(
     }
     AutocorrectSuggestion::mergeAdjacentEdits(allEdits);
     return core::AutocorrectSuggestion{"Add missing imports", std::move(allEdits)};
+}
+
+std::optional<core::AutocorrectSuggestion> PackageInfo::aggregateMissingImportsForFile(const core::GlobalState &gs,
+                                                                                       const core::FileRef fref) const {
+    auto it = packagesReferencedByFile.find(fref);
+    if (it == packagesReferencedByFile.end()) {
+        return std::nullopt;
+    }
+
+    UnorderedMap<core::packages::MangledName, core::packages::ImportType> toImport;
+    for (auto &[packageName, packageReferenceInfo] : it->second) {
+        auto &pkgInfo = gs.packageDB().getPackageInfo(packageName);
+        if (!packageReferenceInfo.importNeeded || packageReferenceInfo.causesModularityError || !pkgInfo.exists()) {
+            continue;
+        }
+        auto importType = fileToImportType(gs, fref);
+        toImport[packageName] = importType;
+    }
+
+    std::vector<core::AutocorrectSuggestion::Edit> allEdits;
+    for (auto &[packageName, importType] : toImport) {
+        auto &pkgInfo = gs.packageDB().getPackageInfo(packageName);
+        auto autocorrect = this->addImport(gs, pkgInfo, importType);
+        if (autocorrect.has_value()) {
+            allEdits.insert(allEdits.end(), make_move_iterator(autocorrect.value().edits.begin()),
+                            make_move_iterator(autocorrect.value().edits.end()));
+        }
+    }
+    if (allEdits.empty()) {
+        return nullopt;
+    }
+    AutocorrectSuggestion::mergeAdjacentEdits(allEdits);
+    return core::AutocorrectSuggestion{"Add missing imports for this file", std::move(allEdits)};
 }
 
 std::optional<core::AutocorrectSuggestion>
@@ -537,6 +572,123 @@ PackageInfo::aggregateMissingExports(const core::GlobalState &gs, vector<core::S
 
     AutocorrectSuggestion::mergeAdjacentEdits(allEdits);
     return core::AutocorrectSuggestion{"Add missing exports", std::move(allEdits)};
+}
+
+static core::SymbolRef getEnumClassForEnumValue(const core::GlobalState &gs, core::SymbolRef sym) {
+    if (sym.isStaticField(gs) && sym.owner(gs).isClassOrModule()) {
+        auto owner = sym.owner(gs);
+        // There's a hidden class like `MyEnum::X$1` between `MyEnum::X` and `T::Enum` in the ancestor chain.
+        if (owner.asClassOrModuleRef().data(gs)->superClass() == core::Symbols::T_Enum()) {
+            return owner;
+        }
+    }
+
+    return core::Symbols::noSymbol();
+}
+
+bool ownerAlreadyExported(const core::GlobalState &gs, vector<core::SymbolRef> &alreadyExported,
+                          core::ClassOrModuleRef owner) {
+    while (owner != core::Symbols::root()) {
+        if (absl::c_find(alreadyExported, owner) != alreadyExported.end()) {
+            return true;
+        }
+        owner = owner.data(gs)->owner;
+    }
+    return false;
+}
+
+void exportClassOrModule(const core::GlobalState &gs,
+                         UnorderedMap<core::packages::MangledName, vector<core::SymbolRef>> &toExport,
+                         core::ClassOrModuleRef symbol, vector<core::FileRef> referencingFiles) {
+    auto data = symbol.data(gs);
+    auto owningPackage = data->package;
+    if (!owningPackage.exists() || gs.packageDB().getPackageInfo(owningPackage).locs.exportAll.exists() ||
+        data->flags.isExported) {
+        return;
+    }
+
+    for (auto &f : referencingFiles) {
+        auto packageForF = gs.packageDB().getPackageNameForFile(f);
+        if (packageForF == owningPackage || gs.packageDB().allowRelaxedPackagerChecksFor(packageForF)) {
+            continue;
+        }
+
+        if (ownerAlreadyExported(gs, toExport[owningPackage], data->owner)) {
+            // No need to check the rest of referencingFiles, we're already going to export the owner
+            break;
+        }
+
+        toExport[owningPackage].push_back(symbol);
+        break;
+    }
+}
+
+void exportField(const core::GlobalState &gs,
+                 UnorderedMap<core::packages::MangledName, vector<core::SymbolRef>> &toExport, core::FieldRef symbol,
+                 vector<core::FileRef> referencingFiles) {
+    auto data = symbol.data(gs);
+    auto owningPackage = data->owner.data(gs)->package;
+    if (!owningPackage.exists() || gs.packageDB().getPackageInfo(owningPackage).locs.exportAll.exists() ||
+        data->flags.isExported) {
+        return;
+    }
+
+    for (auto &f : referencingFiles) {
+        auto packageForF = gs.packageDB().getPackageNameForFile(f);
+        if (packageForF == owningPackage || gs.packageDB().allowRelaxedPackagerChecksFor(packageForF)) {
+            continue;
+        }
+
+        if (ownerAlreadyExported(gs, toExport[owningPackage], data->owner)) {
+            // No need to check the rest of referencingFiles, we're already going to export the owner
+            break;
+        }
+
+        auto maybeEnumClass = getEnumClassForEnumValue(gs, core::SymbolRef(symbol));
+        if (maybeEnumClass.exists()) {
+            // No need to check if maybeEnumClass is already going to be exported since we have a ownerAlreadyExported
+            // call above
+            toExport[owningPackage].push_back(maybeEnumClass);
+        } else {
+            toExport[owningPackage].push_back(symbol);
+        }
+        break;
+    }
+}
+
+// Static on PackageDB?
+std::optional<core::AutocorrectSuggestion> PackageInfo::aggregateMissingExportsForFile(const core::GlobalState &gs,
+                                                                                       const core::FileRef fref) const {
+    auto toExport = UnorderedMap<core::packages::MangledName, vector<core::SymbolRef>>{};
+    auto referencedSymbols = gs.getSymbolsReferencedByFile(fref);
+    for (auto &symbol : referencedSymbols) {
+        if (symbol.isClassOrModule()) {
+            exportClassOrModule(gs, toExport, symbol.asClassOrModuleRef(), {fref});
+        } else if (symbol.isFieldOrStaticField()) {
+            exportField(gs, toExport, symbol.asFieldRef(), {fref});
+        } else {
+            ENFORCE(false);
+        }
+    }
+
+    std::vector<core::AutocorrectSuggestion::Edit> allEdits;
+    for (auto &[packageName, symbolsToExport] : toExport) {
+        auto &pkgInfo = gs.packageDB().getPackageInfo(packageName);
+        for (auto &symbol : symbolsToExport) {
+            auto autocorrect = pkgInfo.addExport(gs, symbol);
+            if (autocorrect.has_value()) {
+                allEdits.insert(allEdits.end(), make_move_iterator(autocorrect.value().edits.begin()),
+                                make_move_iterator(autocorrect.value().edits.end()));
+            }
+        }
+    }
+
+    if (allEdits.empty()) {
+        return nullopt;
+    }
+
+    AutocorrectSuggestion::mergeAdjacentEdits(allEdits);
+    return core::AutocorrectSuggestion{"Add missing exports for file", std::move(allEdits)};
 }
 
 bool PackageInfo::operator==(const PackageInfo &rhs) const {

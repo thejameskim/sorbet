@@ -533,7 +533,6 @@ public:
     }
 
     const UnorderedSet<core::SymbolRef> &getSymbolsReferencedByFile(core::FileRef fref) const {
-        ENFORCE(packageDB().genPackages());
         ENFORCE(symbolsReferencedByFile.size() == this->files->size(),
                 "mismatch in files.size ({}) and symbolsReferencedByFile.size(): ({})", files->size(),
                 symbolsReferencedByFile.size());

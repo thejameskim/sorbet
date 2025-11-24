@@ -436,6 +436,7 @@ class VisibilityCheckerPass final {
         }
     }
 
+    // TODO: move to packageInfo?
     void addImportExportAutocorrect(core::Context ctx, core::ErrorBuilder &e,
                                     optional<core::AutocorrectSuggestion> &&importAutocorrect,
                                     optional<core::AutocorrectSuggestion> &&exportAutocorrect) {
@@ -447,7 +448,12 @@ class VisibilityCheckerPass final {
             importAutocorrect->edits.insert(importAutocorrect->edits.end(),
                                             make_move_iterator(exportAutocorrect->edits.begin()),
                                             make_move_iterator(exportAutocorrect->edits.end()));
-            e.addAutocorrect(core::AutocorrectSuggestion{combinedTitle, move(importAutocorrect->edits)});
+            // NOTE(neil): this means if there's a seperate autocorrect that just imports, or just exports, we will
+            // insert a duplicate, since the deDupKeys will be different. Inserting a duplicate here isn't a big issue
+            // though and it's a rare case.
+            e.addAutocorrect(core::AutocorrectSuggestion{combinedTitle, move(importAutocorrect->edits),
+                                                         false /* isDidYouMean */,
+                                                         /* shouldSkipWhenAggregated */ true});
         } else if (importAutocorrect.has_value()) {
             e.addAutocorrect(std::move(importAutocorrect.value()));
         } else if (exportAutocorrect.has_value()) {
