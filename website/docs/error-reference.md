@@ -2862,18 +2862,18 @@ Note that this error is only reported in `# typed: strict` files and above. Down
 
 ## 5082
 
-Sorbet allow only method definitions in the module or class that defines the root namespace of a package. For example, if the `A::B` module corresponds to the root of a package by the same name, this would be an error:
+If a package contains a sub-package, its root namespace is restricted to not allow mixins. For example, if there are two packages `A` and `A::B`, package `A` is not allowed to define mixins on the `A` module or class. There are no such restrictions on the members of the `A` package, so resolving this error involves moving the functionality off of the package root symbol `A` and onto a member of the `A` package instead. For example,
 
 ```ruby
-module A::B
+module A
   extend Foo # error
 end
 ```
 
-The most straightforward way to resolve this issue is to move the functionality that was on the namespace of the module to a class or module inside of the package. For the above example, we can introduce another class underneath `A::B` to hold the `extend Foo`:
+Could be refactored into:
 
 ```ruby
-module A::B
+module A
   class C
     extend Foo
   end

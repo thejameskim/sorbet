@@ -800,7 +800,7 @@ private:
                     }
                 }
             } else {
-                if (auto e = ctx.beginError(job.ancestor->loc(), core::errors::Resolver::PackageNamespaceMutation)) {
+                if (auto e = ctx.beginError(job.ancestor->loc(), core::errors::Resolver::PackageNamespaceMixin)) {
                     e.setHeader("Package namespace `{}` may not have mixins applied", job.klass.show(ctx));
                 }
             }
