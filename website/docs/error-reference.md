@@ -1103,6 +1103,8 @@ where `...` is some expression which computes a class or module. Sorbet can't kn
 
 `type_member` and `type_template` cannot be used at the top-level of a file. Instead, they must be used inside a class or module definition.
 
+When using `--sorbet-packages`, this error also applies to the root module or class of a package whose namespace contains sub-packages. For example, if there are two packages `Foo` and `Foo::Bar`, the module or class `Foo` may not have `type_member` or `type_template` definitions while `Foo::Bar` would be allowed to. This restriction does not apply to modules or classes that are a member of the `Foo` package, so if there is a class exported by the `Foo` package named `Foo::Baz`, that class is allowed to define type members.
+
 ## 4019
 
 This error is only reported when running Sorbet with the `--uniquely-defined-behavior` command line flag (formerly called `--stripe-mode`).
@@ -2857,6 +2859,26 @@ end
 Sorbet treats the `::Class` and `::Module` classes in the Ruby standard library as generic classes—generic in their [attached class](attached-class.md). For more about this, read [T::Class and T::Module](class-of.md). As a result, code that creates custom subclasses of `::Module` must redeclare this generic type member by writing `has_attached_class!`.
 
 Note that this error is only reported in `# typed: strict` files and above. Downgrading the file that declares an explicit subclass of `Module` to `typed: true` will silence this error. (This also applies to direct subclasses of `Class`, but note that directly subclassing `Class` is rejected by the Ruby VM at runtime.)
+
+## 5082
+
+Sorbet allow only method definitions in the module or class that defines the root namespace of a package. For example, if the `A::B` module corresponds to the root of a package by the same name, this would be an error:
+
+```ruby
+module A::B
+  extend Foo # error
+end
+```
+
+The most straightforward way to resolve this issue is to move the functionality that was on the namespace of the module to a class or module inside of the package. For the above example, we can introduce another class underneath `A::B` to hold the `extend Foo`:
+
+```ruby
+module A::B
+  class C
+    extend Foo
+  end
+end
+```
 
 ## 6001
 
